@@ -1080,6 +1080,7 @@ add_custom_target(vstart-base DEPENDS
     crushtool
     rados
     cython_rados
+    cython_rbd
     )
 
 add_custom_target(vstart DEPENDS
