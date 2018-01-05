@@ -28,7 +28,6 @@
 #include "common/mime.h"
 #include "common/utf8.h"
 #include "common/ceph_json.h"
-#include "common/utf8.h"
 #include "common/ceph_time.h"
 
 #include "rgw_common.h"
@@ -120,6 +119,7 @@ protected:
   int do_aws4_auth_completion();
 
   virtual int init_quota();
+
 public:
   RGWOp()
     : s(nullptr),
@@ -1412,12 +1412,14 @@ class RGWPutLC : public RGWOp {
 protected:
   int len;
   char *data;
+  const char *content_md5;
   string cookie;
 
 public:
   RGWPutLC() {
     len = 0;
-    data = NULL;
+    data = nullptr;
+    content_md5 = nullptr;
   }
   ~RGWPutLC() override {
     free(data);
@@ -1600,6 +1602,7 @@ class RGWCompleteMultipart : public RGWOp {
 protected:
   string upload_id;
   string etag;
+  string version_id;
   char *data;
   int len;
 
@@ -2091,7 +2094,7 @@ public:
 };
 
 class RGWPutBucketPolicy : public RGWOp {
-  int len;
+  int len = 0;
   char *data = nullptr;
 public:
   RGWPutBucketPolicy() = default;

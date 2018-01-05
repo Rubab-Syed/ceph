@@ -279,7 +279,7 @@ add_executable(ceph_test_librgw_file
 set_target_properties(ceph_test_librgw_file PROPERTIES COMPILE_FLAGS
   ${UNITTEST_CXX_FLAGS})
 if(WITH_RADOSGW_FCGI_FRONTEND)
-target_include_directories(ceph_test_librgw_file PRIVATE ${FCGI_INCLUDE_DIR})
+target_include_directories(ceph_test_librgw_file SYSTEM PRIVATE ${FCGI_INCLUDE_DIR})
 endif(WITH_RADOSGW_FCGI_FRONTEND)
 target_link_libraries(ceph_test_librgw_file
   rgw
@@ -324,7 +324,7 @@ add_executable(ceph_test_librgw_file_nfsns
 set_target_properties(ceph_test_librgw_file_nfsns PROPERTIES COMPILE_FLAGS
   ${UNITTEST_CXX_FLAGS})
 if(WITH_RADOSGW_FCGI_FRONTEND)
-target_include_directories(ceph_test_librgw_file_nfsns PRIVATE ${FCGI_INCLUDE_DIR})
+target_include_directories(ceph_test_librgw_file_nfsns SYSTEM PRIVATE ${FCGI_INCLUDE_DIR})
 endif(WITH_RADOSGW_FCGI_FRONTEND)
 target_link_libraries(ceph_test_librgw_file_nfsns
   rgw
@@ -341,6 +341,20 @@ add_executable(ceph_test_librgw_file_aw
 set_target_properties(ceph_test_librgw_file_aw PROPERTIES COMPILE_FLAGS
   ${UNITTEST_CXX_FLAGS})
 target_link_libraries(ceph_test_librgw_file_aw
+  rgw
+  librados
+  ceph-common
+  ${UNITTEST_LIBS}
+  ${EXTRALIBS}
+  )
+
+# ceph_test_librgw_file_marker (READDIR with string and uint64 offsets)
+add_executable(ceph_test_librgw_file_marker
+  librgw_file_marker.cc
+  )
+set_target_properties(ceph_test_librgw_file_marker PROPERTIES COMPILE_FLAGS
+  ${UNITTEST_CXX_FLAGS})
+target_link_libraries(ceph_test_librgw_file_marker
   rgw
   librados
   ceph-common
@@ -612,14 +626,14 @@ add_executable(unittest_encoding
   encoding.cc
   )
 add_ceph_unittest(unittest_encoding)
-target_link_libraries(unittest_encoding ceph-common librados ${XIO_LIBRARY} pthread rt m ${BLKID_LIBRARIES})
+target_link_libraries(unittest_encoding ceph-common)
 
 # unittest_addrs
 add_executable(unittest_addrs
   test_addrs.cc
   )
 add_ceph_unittest(unittest_addrs)
-target_link_libraries(unittest_addrs ceph-common librados ${XIO_LIBRARY} pthread rt m ${BLKID_LIBRARIES})
+target_link_libraries(unittest_addrs ceph-common)
 
 # unittest_workqueue
 add_executable(unittest_workqueue
@@ -627,7 +641,7 @@ add_executable(unittest_workqueue
   $<TARGET_OBJECTS:unit-main>
   )
 add_ceph_unittest(unittest_workqueue)
-target_link_libraries(unittest_workqueue global ${BLKID_LIBRARIES})
+target_link_libraries(unittest_workqueue global)
 
 # unittest_striper
 add_executable(unittest_striper
@@ -642,14 +656,14 @@ add_executable(unittest_prebufferedstreambuf
   test_prebufferedstreambuf.cc
   )
 add_ceph_unittest(unittest_prebufferedstreambuf)
-target_link_libraries(unittest_prebufferedstreambuf global ${BLKID_LIBRARIES})
+target_link_libraries(unittest_prebufferedstreambuf global)
 
 # unittest_str_list
 add_executable(unittest_str_list
   test_str_list.cc
   )
 add_ceph_unittest(unittest_str_list)
-target_link_libraries(unittest_str_list global ${BLKID_LIBRARIES})
+target_link_libraries(unittest_str_list global)
 
 # unittest_log
 add_executable(unittest_log
@@ -721,7 +735,7 @@ add_executable(unittest_xlist
   test_xlist.cc
   )
 add_ceph_unittest(unittest_xlist)
-target_link_libraries(unittest_xlist ceph-common ${XIO_LIBRARY})
+target_link_libraries(unittest_xlist ceph-common)
 
 # unittest_arch
 add_executable(unittest_arch

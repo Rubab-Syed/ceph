@@ -26,7 +26,7 @@
 
 #include "os/ObjectStore.h"
 #include "os/filestore/FileStore.h"
-#if defined(HAVE_LIBAIO)
+#if defined(WITH_BLUESTORE)
 #include "os/bluestore/BlueStore.h"
 #endif
 #include "include/Context.h"
@@ -62,7 +62,7 @@ static bool bl_eq(bufferlist& expected, bufferlist& actual)
          << "expected 0x" << expected.length() << " != actual 0x"
          << actual.length() << std::dec << dendl;
   }
-  auto len = MIN(expected.length(), actual.length());
+  auto len = std::min(expected.length(), actual.length());
   while ( first<len && expected[first] == actual[first])
     ++first;
   unsigned last = len;
@@ -1327,7 +1327,7 @@ TEST_P(StoreTest, SimpleObjectTest) {
   }
 }
 
-#if defined(HAVE_LIBAIO)
+#if defined(WITH_BLUESTORE)
 TEST_P(StoreTestSpecificAUSize, BluestoreStatFSTest) {
   if(string(GetParam()) != "bluestore")
     return;
@@ -2465,6 +2465,7 @@ TEST_P(StoreTest, SimpleListTest) {
     r = apply_transaction(store, &osr, std::move(t));
     ASSERT_EQ(r, 0);
   }
+  osr.flush();
   {
     set<ghobject_t> saw;
     vector<ghobject_t> objects;
@@ -2529,6 +2530,7 @@ TEST_P(StoreTest, ListEndTest) {
     r = apply_transaction(store, &osr, std::move(t));
     ASSERT_EQ(r, 0);
   }
+  osr.flush();
   {
     ghobject_t end(hobject_t(sobject_t("object_100", CEPH_NOSNAP)),
 		   ghobject_t::NO_GEN, shard_id_t(1));
@@ -2611,6 +2613,7 @@ TEST_P(StoreTest, MultipoolListTest) {
     r = apply_transaction(store, &osr, std::move(t));
     ASSERT_EQ(r, 0);
   }
+  osr.flush();
   {
     vector<ghobject_t> objects;
     ghobject_t next, current;
@@ -3276,6 +3279,8 @@ TEST_P(StoreTest, ManyObjectTest) {
     ASSERT_TRUE(!store->stat(cid, *i, &buf));
   }
 
+  osr.flush();
+
   set<ghobject_t> listed, listed2;
   vector<ghobject_t> objects;
   r = store->collection_list(cid, ghobject_t(), ghobject_t::get_max(), INT_MAX, &objects, 0);
@@ -3533,6 +3538,7 @@ public:
   }
   void shutdown() {
     while (1) {
+      osr->flush();
       vector<ghobject_t> objects;
       int r = store->collection_list(cid, ghobject_t(), ghobject_t::get_max(),
 				     10, &objects, 0);
@@ -3914,16 +3920,18 @@ public:
       len = ROUND_UP_TO(len, write_alignment);
     }
 
-    auto& data = contents[new_obj].data;
-    if (data.length() < offset + len) {
-      data.append_zero(offset+len-data.length());
+    if (len > 0) {
+      auto& data = contents[new_obj].data;
+      if (data.length() < offset + len) {
+	data.append_zero(offset+len-data.length());
+      }
+      bufferlist n;
+      n.substr_of(data, 0, offset);
+      n.append_zero(len);
+      if (data.length() > offset + len)
+	data.copy(offset + len, data.length() - offset - len, n);
+      data.swap(n);
     }
-    bufferlist n;
-    n.substr_of(data, 0, offset);
-    n.append_zero(len);
-    if (data.length() > offset + len)
-      data.copy(offset + len, data.length() - offset - len, n);
-    data.swap(n);
 
     t.zero(cid, new_obj, offset, len);
     ++in_flight;
@@ -4138,6 +4146,7 @@ public:
     EnterExit ee("scan");
     while (in_flight)
       cond.Wait(lock);
+    osr->flush();
     vector<ghobject_t> objects;
     set<ghobject_t> objects_set, objects_set2;
     ghobject_t next, current;
@@ -4561,6 +4570,7 @@ TEST_P(StoreTest, HashCollisionTest) {
   }
   }
   vector<ghobject_t> objects;
+  osr.flush();
   r = store->collection_list(cid, ghobject_t(), ghobject_t::get_max(), INT_MAX, &objects, 0);
   ASSERT_EQ(r, 0);
   set<ghobject_t> listed(objects.begin(), objects.end());
@@ -4658,6 +4668,7 @@ TEST_P(StoreTest, ScrubTest) {
     ASSERT_EQ(r, 0);
   }
 
+  osr.flush();
   vector<ghobject_t> objects;
   r = store->collection_list(cid, ghobject_t(), ghobject_t::get_max(),
 			     INT_MAX, &objects, 0);
@@ -5132,6 +5143,7 @@ void colsplittest(
     ASSERT_EQ(r, 0);
   }
 
+  osr.flush();
   ObjectStore::Transaction t;
   vector<ghobject_t> objects;
   r = store->collection_list(cid, ghobject_t(), ghobject_t::get_max(),
@@ -5152,6 +5164,7 @@ void colsplittest(
     }
   }
 
+  osr.flush();
   objects.clear();
   r = store->collection_list(tid, ghobject_t(), ghobject_t::get_max(),
 			     INT_MAX, &objects, 0);
@@ -5429,6 +5442,8 @@ TEST_P(StoreTest, BigRGWObjectName) {
     ASSERT_EQ(r, 0);
   }
 
+  osr.flush();
+
   {
     vector<ghobject_t> objects;
     r = store->collection_list(cid, ghobject_t(), ghobject_t::get_max(),
@@ -5523,7 +5538,7 @@ TEST_P(StoreTest, TryMoveRename) {
   ASSERT_EQ(store->stat(cid, hoid2, &st), 0);
 }
 
-#if defined(HAVE_LIBAIO)
+#if defined(WITH_BLUESTORE)
 TEST_P(StoreTest, BluestoreOnOffCSumTest) {
   if (string(GetParam()) != "bluestore")
     return;
@@ -5712,7 +5727,7 @@ INSTANTIATE_TEST_CASE_P(
   ::testing::Values(
     "memstore",
     "filestore",
-#if defined(HAVE_LIBAIO)
+#if defined(WITH_BLUESTORE)
     "bluestore",
 #endif
     "kstore"));
@@ -5724,7 +5739,7 @@ INSTANTIATE_TEST_CASE_P(
   ::testing::Values(
     "memstore",
     "filestore",
-#if defined(HAVE_LIBAIO)
+#if defined(WITH_BLUESTORE)
     "bluestore",
 #endif
     "kstore"));
@@ -5823,7 +5838,7 @@ TEST_P(StoreTestSpecificAUSize, TooManyBlobsTest) {
   ASSERT_EQ(res_stat.allocated, max_object);
 }
 
-#if defined(HAVE_LIBAIO)
+#if defined(WITH_BLUESTORE)
 void get_mempool_stats(uint64_t* total_bytes, uint64_t* total_items)
 {
   uint64_t onode_allocated = mempool::bluestore_cache_onode::allocated_bytes();
@@ -6464,7 +6479,7 @@ TEST_P(StoreTestSpecificAUSize, SmallWriteOnShardedExtents) {
   g_conf->set_val("bluestore_csum_type", "crc32c");
 }
 
-#endif //#if defined(HAVE_LIBAIO)
+#endif //#if defined(WITH_BLUESTORE)
 
 TEST_P(StoreTest, KVDBHistogramTest) {
   if (string(GetParam()) != "bluestore")
@@ -6549,7 +6564,7 @@ TEST_P(StoreTest, KVDBStatsTest) {
   g_conf->set_val("rocksdb_collect_memory_stats","false");
 }
 
-#if defined(HAVE_LIBAIO)
+#if defined(WITH_BLUESTORE)
 TEST_P(StoreTestSpecificAUSize, garbageCollection) {
   ObjectStore::Sequencer osr("test");
   int r;
@@ -6717,6 +6732,42 @@ TEST_P(StoreTestSpecificAUSize, garbageCollection) {
 }
 #endif
 
+TEST_P(StoreTestSpecificAUSize, fsckOnUnalignedDevice) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  g_conf->set_val("bluestore_block_size", stringify(0x280005000)); //10 Gb + 4K
+  g_conf->set_val("bluestore_fsck_on_mount", "false");
+  g_conf->set_val("bluestore_fsck_on_umount", "false");
+  StartDeferred(0x4000);
+  store->umount();
+  ASSERT_EQ(store->fsck(false), 0); // do fsck explicitly
+  store->mount();
+
+  g_conf->set_val("bluestore_fsck_on_mount", "true");
+  g_conf->set_val("bluestore_fsck_on_umount", "true");
+  g_conf->set_val("bluestore_block_size", stringify(0x280000000)); // 10 Gb
+  g_conf->apply_changes(NULL);
+}
+
+TEST_P(StoreTestSpecificAUSize, fsckOnUnalignedDevice2) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  g_conf->set_val("bluestore_block_size", stringify(0x280005000)); //10 Gb + 20K
+  g_conf->set_val("bluestore_fsck_on_mount", "false");
+  g_conf->set_val("bluestore_fsck_on_umount", "false");
+  StartDeferred(0x1000);
+  store->umount();
+  ASSERT_EQ(store->fsck(false), 0); // do fsck explicitly
+  store->mount();
+
+  g_conf->set_val("bluestore_block_size", stringify(0x280000000)); // 10 Gb
+  g_conf->set_val("bluestore_fsck_on_mount", "true");
+  g_conf->set_val("bluestore_fsck_on_umount", "true");
+  g_conf->apply_changes(NULL);
+}
+
 int main(int argc, char **argv) {
   vector<const char*> args;
   argv_to_vec(argc, (const char **)argv, args);
@@ -6730,7 +6781,7 @@ int main(int argc, char **argv) {
   g_ceph_context->_conf->set_val("filestore_index_retry_probability", "0.5");
   g_ceph_context->_conf->set_val("filestore_op_thread_timeout", "1000");
   g_ceph_context->_conf->set_val("filestore_op_thread_suicide_timeout", "10000");
-  g_ceph_context->_conf->set_val("filestore_fiemap", "true");
+  //g_ceph_context->_conf->set_val("filestore_fiemap", "true");
   g_ceph_context->_conf->set_val("bluestore_fsck_on_mount", "true");
   g_ceph_context->_conf->set_val("bluestore_fsck_on_umount", "true");
   g_ceph_context->_conf->set_val("bluestore_debug_misc", "true");

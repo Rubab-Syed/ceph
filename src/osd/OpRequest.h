@@ -13,17 +13,10 @@
 
 #ifndef OPREQUEST_H_
 #define OPREQUEST_H_
-#include <sstream>
-#include <stdint.h>
-#include <vector>
 
-#include <include/utime.h>
-#include "common/Mutex.h"
-#include "include/xlist.h"
-#include "msg/Message.h"
-#include "include/memory.h"
 #include "osd/osd_types.h"
 #include "common/TrackedOp.h"
+#include "common/mClockCommon.h"
 
 /**
  * The OpRequest takes in a Message* and takes over a single reference
@@ -115,6 +108,7 @@ public:
   epoch_t min_epoch = 0;      ///< min epoch needed to handle this msg
 
   bool hitset_inserted;
+  dmc::PhaseType qos_resp;
   const Message *get_req() const { return request; }
   Message *get_nonconst_req() { return request; }
 

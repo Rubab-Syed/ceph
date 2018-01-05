@@ -978,8 +978,8 @@ inline ostream& operator<<(ostream& out, const osd_stat_t& s) {
 #define PG_STATE_ACTIVE             (1ULL << 1)  // i am active.  (primary: replicas too)
 #define PG_STATE_CLEAN              (1ULL << 2)  // peers are complete, clean of stray replicas.
 #define PG_STATE_DOWN               (1ULL << 4)  // a needed replica is down, PG offline
-//#define PG_STATE_REPLAY           (1ULL << 5)  // crashed, waiting for replay
-//#define PG_STATE_STRAY            (1ULL << 6)  // i must notify the primary i exist.
+#define PG_STATE_RECOVERY_UNFOUND   (1ULL << 5)  // recovery stopped due to unfound
+#define PG_STATE_BACKFILL_UNFOUND   (1ULL << 6)  // backfill stopped due to unfound
 //#define PG_STATE_SPLITTING        (1ULL << 7)  // i am splitting
 #define PG_STATE_SCRUBBING          (1ULL << 8)  // scrubbing
 //#define PG_STATE_SCRUBQ           (1ULL << 9)  // queued for scrub
@@ -1157,6 +1157,8 @@ struct pg_pool_t {
     FLAG_FULL_QUOTA = 1<<10, // pool is currently running out of quota, will set FLAG_FULL too
     FLAG_NEARFULL = 1<<11, // pool is nearfull
     FLAG_BACKFILLFULL = 1<<12, // pool is backfillfull
+    FLAG_SELFMANAGED_SNAPS = 1<<13, // pool uses selfmanaged snaps
+    FLAG_POOL_SNAPS = 1<<14,        // pool has pool snaps
   };
 
   static const char *get_flag_name(int f) {
@@ -1174,6 +1176,8 @@ struct pg_pool_t {
     case FLAG_FULL_QUOTA: return "full_quota";
     case FLAG_NEARFULL: return "nearfull";
     case FLAG_BACKFILLFULL: return "backfillfull";
+    case FLAG_SELFMANAGED_SNAPS: return "selfmanaged_snaps";
+    case FLAG_POOL_SNAPS: return "pool_snaps";
     default: return "???";
     }
   }
@@ -1218,6 +1222,10 @@ struct pg_pool_t {
       return FLAG_NEARFULL;
     if (name == "backfillfull")
       return FLAG_BACKFILLFULL;
+    if (name == "selfmanaged_snaps")
+      return FLAG_SELFMANAGED_SNAPS;
+    if (name == "pool_snaps")
+      return FLAG_POOL_SNAPS;
     return 0;
   }
 
@@ -1300,7 +1308,6 @@ public:
   snapid_t snap_seq;        ///< seq for per-pool snapshot
   epoch_t snap_epoch;       ///< osdmap epoch of last snap
   uint64_t auid;            ///< who owns the pg
-  __u32 crash_replay_interval; ///< seconds to allow clients to replay ACKed but unCOMMITted requests
 
   uint64_t quota_max_bytes; ///< maximum number of bytes for this pool
   uint64_t quota_max_objects; ///< maximum number of objects for this pool
@@ -1417,7 +1424,6 @@ public:
       last_force_op_resend_preluminous(0),
       snap_seq(0), snap_epoch(0),
       auid(0),
-      crash_replay_interval(0),
       quota_max_bytes(0), quota_max_objects(0),
       pg_num_mask(0), pgp_num_mask(0),
       tier_of(-1), read_tier(-1), write_tier(-1),
@@ -1474,7 +1480,6 @@ public:
   epoch_t get_snap_epoch() const { return snap_epoch; }
   snapid_t get_snap_seq() const { return snap_seq; }
   uint64_t get_auid() const { return auid; }
-  unsigned get_crash_replay_interval() const { return crash_replay_interval; }
 
   void set_snap_seq(snapid_t s) { snap_seq = s; }
   void set_snap_epoch(epoch_t e) { snap_epoch = e; }
@@ -1659,6 +1664,7 @@ struct object_stat_sum_t {
   int64_t num_objects_pinned;
   int64_t num_objects_missing;
   int64_t num_legacy_snapsets; ///< upper bound on pre-luminous-style SnapSets
+  int64_t num_large_omap_objects = 0;
 
   object_stat_sum_t()
     : num_bytes(0),
@@ -1706,6 +1712,7 @@ struct object_stat_sum_t {
     FLOOR(num_wr);
     FLOOR(num_wr_kb);
     FLOOR(num_scrub_errors);
+    FLOOR(num_large_omap_objects);
     FLOOR(num_shallow_scrub_errors);
     FLOOR(num_deep_scrub_errors);
     FLOOR(num_objects_recovered);
@@ -1760,6 +1767,7 @@ struct object_stat_sum_t {
     SPLIT(num_wr);
     SPLIT(num_wr_kb);
     SPLIT(num_scrub_errors);
+    SPLIT(num_large_omap_objects);
     SPLIT(num_shallow_scrub_errors);
     SPLIT(num_deep_scrub_errors);
     SPLIT(num_objects_recovered);
@@ -1816,6 +1824,7 @@ struct object_stat_sum_t {
         sizeof(num_wr) +
         sizeof(num_wr_kb) +
         sizeof(num_scrub_errors) +
+        sizeof(num_large_omap_objects) +
         sizeof(num_objects_recovered) +
         sizeof(num_bytes_recovered) +
         sizeof(num_keys_recovered) +
@@ -1944,6 +1953,8 @@ struct pg_stat_t {
   epoch_t mapping_epoch;
 
   vector<int32_t> blocked_by;  ///< osds on which the pg is blocked
+
+  interval_set<snapid_t> purged_snaps;  ///< recently removed snaps that we've purged
 
   utime_t last_became_active;
   utime_t last_became_peered;
@@ -3596,10 +3607,6 @@ public:
     return head.version == 0 && head.epoch == 0;
   }
 
-  size_t approx_size() const {
-    return head.version - tail.version;
-  }
-
   static void filter_log(spg_t import_pgid, const OSDMap &curmap,
     const string &hit_set_namespace, const pg_log_t &in,
     pg_log_t &out, pg_log_t &reject);
@@ -3748,7 +3755,6 @@ public:
   virtual bool have_missing() const = 0;
   virtual bool is_missing(const hobject_t& oid, pg_missing_item *out = nullptr) const = 0;
   virtual bool is_missing(const hobject_t& oid, eversion_t v) const = 0;
-  virtual eversion_t have_old(const hobject_t& oid) const = 0;
   virtual ~pg_missing_const_i() {}
 };
 
@@ -3839,13 +3845,13 @@ public:
       return false;
     return true;
   }
-  eversion_t have_old(const hobject_t& oid) const override {
-    map<hobject_t, item>::const_iterator m =
-      missing.find(oid);
-    if (m == missing.end())
+  eversion_t get_oldest_need() const {
+    if (missing.empty()) {
       return eversion_t();
-    const item &item(m->second);
-    return item.have;
+    }
+    auto it = missing.find(rmissing.begin()->second);
+    assert(it != missing.end());
+    return it->second.need;
   }
 
   void claim(pg_missing_set& o) {
@@ -4477,16 +4483,6 @@ struct SnapSet {
     return out;
   }
 
-  // return min element of snaps > after, return max if no such element
-  snapid_t get_first_snap_after(snapid_t after, snapid_t max) const {
-    for (vector<snapid_t>::const_reverse_iterator i = snaps.rbegin();
-	 i != snaps.rend();
-	 ++i) {
-      if (*i > after)
-	return *i;
-    }
-    return max;
-  }
 
   SnapSet get_filtered(const pg_pool_t &pinfo) const;
   void filter(const pg_pool_t &pinfo);
@@ -4538,15 +4534,48 @@ static inline ostream& operator<<(ostream& out, const notify_info_t& n) {
 	     << " " << n.timeout << "s)";
 }
 
+struct chunk_info_t {
+  enum {
+    FLAG_DIRTY = 1, 
+    FLAG_MISSING = 2,
+  };
+  uint32_t offset;
+  uint32_t length;
+  hobject_t oid;
+  uint32_t flags;   // FLAG_*
+
+  chunk_info_t() : offset(0), length(0), flags(0) { }
+
+  static string get_flag_string(uint64_t flags) {
+    string r;
+    if (flags & FLAG_DIRTY) {
+      r += "|dirty";
+    }
+    if (flags & FLAG_MISSING) {
+      r += "|missing";
+    }
+    if (r.length())
+      return r.substr(1);
+    return r;
+  }
+  void encode(bufferlist &bl) const;
+  void decode(bufferlist::iterator &bl);
+  void dump(Formatter *f) const;
+  friend ostream& operator<<(ostream& out, const chunk_info_t& ci);
+};
+WRITE_CLASS_ENCODER(chunk_info_t)
+ostream& operator<<(ostream& out, const chunk_info_t& ci);
+
 struct object_info_t;
 struct object_manifest_t {
   enum {
     TYPE_NONE = 0,
-    TYPE_REDIRECT = 1,  // start with this
-    TYPE_CHUNKED = 2,   // do this later
+    TYPE_REDIRECT = 1, 
+    TYPE_CHUNKED = 2, 
   };
   uint8_t type;  // redirect, chunked, ...
   hobject_t redirect_target;
+  map <uint64_t, chunk_info_t> chunk_map;
 
   object_manifest_t() : type(0) { }
   object_manifest_t(uint8_t type, const hobject_t& redirect_target) 
@@ -4571,6 +4600,11 @@ struct object_manifest_t {
   }
   const char *get_type_name() const {
     return get_type_name(type);
+  }
+  void clear() {
+    type = 0;
+    redirect_target = hobject_t();
+    chunk_map.clear();
   }
   static void generate_test_instances(list<object_manifest_t*>& o);
   void encode(bufferlist &bl) const;
@@ -4870,12 +4904,16 @@ struct ScrubMap {
     bool stat_error:1;
     bool ec_hash_mismatch:1;
     bool ec_size_mismatch:1;
+    bool large_omap_object_found:1;
+    uint64_t large_omap_object_key_count = 0;
+    uint64_t large_omap_object_value_size = 0;
 
     object() :
       // Init invalid size so it won't match if we get a stat EIO error
       size(-1), omap_digest(0), digest(0),
-      negative(false), digest_present(false), omap_digest_present(false), 
-      read_error(false), stat_error(false), ec_hash_mismatch(false), ec_size_mismatch(false) {}
+      negative(false), digest_present(false), omap_digest_present(false),
+      read_error(false), stat_error(false), ec_hash_mismatch(false),
+      ec_size_mismatch(false), large_omap_object_found(false) {}
 
     void encode(bufferlist& bl) const;
     void decode(bufferlist::iterator& bl);
@@ -4887,6 +4925,7 @@ struct ScrubMap {
   map<hobject_t,object> objects;
   eversion_t valid_through;
   eversion_t incr_since;
+  bool has_large_omap_object_errors:1;
 
   void merge_incr(const ScrubMap &l);
   void insert(const ScrubMap &r) {

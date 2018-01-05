@@ -88,16 +88,6 @@ static constexpr uint16_t rx_gc_thresh           = 64;
 static constexpr uint16_t mbufs_per_queue_tx     = 2 * default_ring_size;
 
 static constexpr uint16_t mbuf_cache_size        = 512;
-static constexpr uint16_t mbuf_overhead          =
-sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM;
-//
-// We'll allocate 2K data buffers for an inline case because this would require
-// a single page per mbuf. If we used 4K data buffers here it would require 2
-// pages for a single buffer (due to "mbuf_overhead") and this is a much more
-// demanding memory constraint.
-//
-static constexpr size_t inline_mbuf_data_size = 2048;
-
 //
 // Size of the data buffer in the non-inline case.
 //
@@ -106,6 +96,17 @@ static constexpr size_t inline_mbuf_data_size = 2048;
 // above.
 //
 static constexpr size_t mbuf_data_size = 4096;
+
+static constexpr uint16_t mbuf_overhead          =
+                          sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM;
+//
+// We'll allocate 2K data buffers for an inline case because this would require
+// a single page per mbuf. If we used 4K data buffers here it would require 2
+// pages for a single buffer (due to "mbuf_overhead") and this is a much more
+// demanding memory constraint.
+//
+static constexpr size_t inline_mbuf_data_size = 2048;
+
 
 // (INLINE_MBUF_DATA_SIZE(2K)*32 = 64K = Max TSO/LRO size) + 1 mbuf for headers
 static constexpr uint8_t max_frags = 32 + 1;
@@ -495,6 +496,9 @@ bool DPDKQueuePair::init_rx_mbuf_pool()
 {
   std::string name = std::string(pktmbuf_pool_name) + std::to_string(_qid) + "_rx";
 
+  int bufs_count =  cct->_conf->ms_dpdk_rx_buffer_count_per_core - mbufs_per_queue_rx;
+  int mz_flags = RTE_MEMZONE_1GB|RTE_MEMZONE_SIZE_HINT_ONLY;
+  char mz_name[RTE_MEMZONE_NAMESIZE];
   // reserve the memory for Rx buffers containers
   _rx_free_pkts.reserve(mbufs_per_queue_rx);
   _rx_free_bufs.reserve(mbufs_per_queue_rx);
@@ -512,7 +516,7 @@ bool DPDKQueuePair::init_rx_mbuf_pool()
     roomsz.mbuf_data_room_size = mbuf_data_size + RTE_PKTMBUF_HEADROOM;
     _pktmbuf_pool_rx = rte_mempool_create(
         name.c_str(),
-        mbufs_per_queue_rx, mbuf_overhead,
+        mbufs_per_queue_rx, mbuf_overhead + mbuf_data_size,
         mbuf_cache_size,
         sizeof(struct rte_pktmbuf_pool_private),
         rte_pktmbuf_pool_init, as_cookie(roomsz),
@@ -528,30 +532,21 @@ bool DPDKQueuePair::init_rx_mbuf_pool()
     // 2) Bind data buffers to each of them.
     // 3) Return them back to the pool.
     //
-    for (int i = 0; i < mbufs_per_queue_rx; i++) {
-      rte_mbuf* m = rte_pktmbuf_alloc(_pktmbuf_pool_rx);
-      assert(m);
-      _rx_free_bufs.push_back(m);
+    int ret = snprintf(mz_name, sizeof(mz_name),
+         "%s",  "rx_buffer_data" + std::to_string(_qid));
+    if (ret < 0 || ret >= (int)sizeof(mz_name)) {
+      return false;
     }
-
-    for (int i = 0; i < cct->_conf->ms_dpdk_rx_buffer_count_per_core; i++) {
-      void* m = rte_malloc(NULL, mbuf_data_size, mbuf_data_size);
+    const struct rte_memzone *mz = rte_memzone_reserve_aligned(mz_name, mbuf_data_size*bufs_count,
+                                   _pktmbuf_pool_rx->socket_id, mz_flags, mbuf_data_size);
+    assert(mz);
+    void* m = mz->addr;
+    for (int i = 0; i < bufs_count; i++) {
       assert(m);
       _alloc_bufs.push_back(m);
+      m += mbuf_data_size;
     }
 
-    for (auto&& m : _rx_free_bufs) {
-      if (!init_noninline_rx_mbuf(m, mbuf_data_size, _alloc_bufs)) {
-        lderr(cct) << __func__ << " Failed to allocate data buffers for Rx ring. "
-                   "Consider increasing the amount of memory." << dendl;
-        return false;
-      }
-    }
-
-    rte_mempool_put_bulk(_pktmbuf_pool_rx, (void**)_rx_free_bufs.data(),
-                         _rx_free_bufs.size());
-
-    _rx_free_bufs.clear();
     if (rte_eth_rx_queue_setup(_dev_port_idx, _qid, default_ring_size,
                                rte_eth_dev_socket_id(_dev_port_idx),
                                _dev->def_rx_conf(), _pktmbuf_pool_rx) < 0) {
@@ -560,7 +555,6 @@ bool DPDKQueuePair::init_rx_mbuf_pool()
     }
   }
 
-  ldout(cct, 20) << __func__ << " count " << rte_mempool_count(_pktmbuf_pool_rx) << " free count " << rte_mempool_free_count(_pktmbuf_pool_rx) << dendl;
   return _pktmbuf_pool_rx != nullptr;
 }
 
@@ -783,8 +777,6 @@ bool DPDKQueuePair::rx_gc(bool force)
     ldout(cct, 10) << __func__ << " free segs " << _num_rx_free_segs
                    << " thresh " << rx_gc_thresh
                    << " free pkts " << _rx_free_pkts.size()
-                   << " pool count " << rte_mempool_count(_pktmbuf_pool_rx)
-                   << " free pool count " << rte_mempool_free_count(_pktmbuf_pool_rx)
                    << dendl;
 
     while (!_rx_free_pkts.empty()) {
@@ -800,6 +792,9 @@ bool DPDKQueuePair::rx_gc(bool force)
         ldout(cct, 1) << __func__ << " get new mbuf failed " << dendl;
         break;
       }
+    }
+    for (auto&& m : _rx_free_bufs) {
+      rte_pktmbuf_prefree_seg(m);
     }
 
     if (_rx_free_bufs.size()) {
@@ -846,7 +841,7 @@ void DPDKQueuePair::process_packets(
 
     // Set stipped VLAN value if available
     if ((_dev->_dev_info.rx_offload_capa & DEV_RX_OFFLOAD_VLAN_STRIP) &&
-        (m->ol_flags & PKT_RX_VLAN_PKT)) {
+        (m->ol_flags & PKT_RX_VLAN_STRIPPED)) {
       oi.vlan_tci = m->vlan_tci;
     }
 

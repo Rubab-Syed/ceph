@@ -13,6 +13,14 @@ class TestParseTags(object):
         result = api.parse_tags('ceph.osd_something=1')
         assert result == {'ceph.osd_something': '1'}
 
+    def test_non_ceph_tags_are_skipped(self):
+        result = api.parse_tags('foo')
+        assert result == {}
+
+    def test_mixed_non_ceph_tags(self):
+        result = api.parse_tags('foo,ceph.bar=1')
+        assert result == {'ceph.bar': '1'}
+
     def test_multiple_csv_expands_in_dict(self):
         result = api.parse_tags('ceph.osd_something=1,ceph.foo=2,ceph.fsid=0000')
         # assert them piecemeal to avoid the un-ordered dict nature
@@ -73,6 +81,9 @@ def volumes(monkeypatch):
     monkeypatch.setattr(process, 'call', lambda x: ('', '', 0))
     volumes = api.Volumes()
     volumes._purge()
+    # also patch api.Volumes so that when it is called, it will use the newly
+    # created fixture, with whatever the test method wants to append to it
+    monkeypatch.setattr(api, 'Volumes', lambda: volumes)
     return volumes
 
 
@@ -325,6 +336,47 @@ class TestVolumeGroups(object):
             volume_groups.filter()
 
 
+class TestGetLVFromArgument(object):
+
+    def setup(self):
+        self.foo_volume = api.Volume(
+            lv_name='foo', lv_path='/path/to/lv',
+            vg_name='foo_group', lv_tags=''
+        )
+
+    def test_non_absolute_path_is_not_valid(self, volumes):
+        volumes.append(self.foo_volume)
+        assert api.get_lv_from_argument('foo') is None
+
+    def test_too_many_slashes_is_invalid(self, volumes):
+        volumes.append(self.foo_volume)
+        assert api.get_lv_from_argument('path/to/lv') is None
+
+    def test_absolute_path_is_not_lv(self, volumes):
+        volumes.append(self.foo_volume)
+        assert api.get_lv_from_argument('/path') is None
+
+    def test_absolute_path_is_lv(self, volumes):
+        volumes.append(self.foo_volume)
+        assert api.get_lv_from_argument('/path/to/lv') == self.foo_volume
+
+
+class TestRemoveLV(object):
+
+    def test_removes_lv(self, monkeypatch):
+        def mock_call(cmd, **kw):
+            return ('', '', 0)
+        monkeypatch.setattr(process, 'call', mock_call)
+        assert api.remove_lv("vg/lv")
+
+    def test_fails_to_remove_lv(self, monkeypatch):
+        def mock_call(cmd, **kw):
+            return ('', '', 1)
+        monkeypatch.setattr(process, 'call', mock_call)
+        with pytest.raises(RuntimeError):
+            api.remove_lv("vg/lv")
+
+
 class TestCreateLV(object):
 
     def setup(self):
@@ -334,22 +386,22 @@ class TestCreateLV(object):
         monkeypatch.setattr(process, 'run', capture)
         monkeypatch.setattr(process, 'call', capture)
         monkeypatch.setattr(api, 'get_lv', lambda *a, **kw: self.foo_volume)
-        api.create_lv('foo', 'foo_group', size=5, type='data')
-        expected = ['sudo', 'lvcreate', '--yes', '-L', '5G', '-n', 'foo', 'foo_group']
+        api.create_lv('foo', 'foo_group', size='5G', tags={'ceph.type': 'data'})
+        expected = ['lvcreate', '--yes', '-L', '5G', '-n', 'foo', 'foo_group']
         assert capture.calls[0]['args'][0] == expected
 
     def test_calls_to_set_type_tag(self, monkeypatch, capture):
         monkeypatch.setattr(process, 'run', capture)
         monkeypatch.setattr(process, 'call', capture)
         monkeypatch.setattr(api, 'get_lv', lambda *a, **kw: self.foo_volume)
-        api.create_lv('foo', 'foo_group', size=5, type='data')
-        ceph_tag = ['sudo', 'lvchange', '--addtag', 'ceph.type=data', '/path']
+        api.create_lv('foo', 'foo_group', size='5G', tags={'ceph.type': 'data'})
+        ceph_tag = ['lvchange', '--addtag', 'ceph.type=data', '/path']
         assert capture.calls[1]['args'][0] == ceph_tag
 
     def test_calls_to_set_data_tag(self, monkeypatch, capture):
         monkeypatch.setattr(process, 'run', capture)
         monkeypatch.setattr(process, 'call', capture)
         monkeypatch.setattr(api, 'get_lv', lambda *a, **kw: self.foo_volume)
-        api.create_lv('foo', 'foo_group', size=5, type='data')
-        data_tag = ['sudo', 'lvchange', '--addtag', 'ceph.data_device=/path', '/path']
+        api.create_lv('foo', 'foo_group', size='5G', tags={'ceph.type': 'data'})
+        data_tag = ['lvchange', '--addtag', 'ceph.data_device=/path', '/path']
         assert capture.calls[2]['args'][0] == data_tag

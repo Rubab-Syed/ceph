@@ -63,6 +63,8 @@ def parse_tags(lv_tags):
     tag_mapping = {}
     tags = lv_tags.split(',')
     for tag_assignment in tags:
+        if not tag_assignment.startswith('ceph.'):
+            continue
         key, value = tag_assignment.split('=', 1)
         tag_mapping[key] = value
 
@@ -76,7 +78,7 @@ def get_api_vgs():
 
     Command and sample delimeted output, should look like::
 
-        $ sudo vgs --noheadings --separator=';' \
+        $ vgs --noheadings --separator=';' \
           -o vg_name,pv_count,lv_count,snap_count,vg_attr,vg_size,vg_free
           ubuntubox-vg;1;2;0;wz--n-;299.52g;12.00m
           osd_vg;3;1;0;wz--n-;29.21g;9.21g
@@ -84,7 +86,7 @@ def get_api_vgs():
     """
     fields = 'vg_name,pv_count,lv_count,snap_count,vg_attr,vg_size,vg_free'
     stdout, stderr, returncode = process.call(
-        ['sudo', 'vgs', '--noheadings', '--separator=";"', '-o', fields]
+        ['vgs', '--noheadings', '--separator=";"', '-o', fields]
     )
     return _output_parser(stdout, fields)
 
@@ -96,14 +98,14 @@ def get_api_lvs():
 
     Command and delimeted output, should look like::
 
-        $ sudo lvs --noheadings --separator=';' -o lv_tags,lv_path,lv_name,vg_name
+        $ lvs --noheadings --separator=';' -o lv_tags,lv_path,lv_name,vg_name
           ;/dev/ubuntubox-vg/root;root;ubuntubox-vg
           ;/dev/ubuntubox-vg/swap_1;swap_1;ubuntubox-vg
 
     """
     fields = 'lv_tags,lv_path,lv_name,vg_name,lv_uuid'
     stdout, stderr, returncode = process.call(
-        ['sudo', 'lvs', '--noheadings', '--separator=";"', '-o', fields]
+        ['lvs', '--noheadings', '--separator=";"', '-o', fields]
     )
     return _output_parser(stdout, fields)
 
@@ -115,7 +117,7 @@ def get_api_pvs():
 
     Command and delimeted output, should look like::
 
-        $ sudo pvs --noheadings --separator=';' -o pv_name,pv_tags,pv_uuid
+        $ pvs --noheadings --separator=';' -o pv_name,pv_tags,pv_uuid
           /dev/sda1;;
           /dev/sdv;;07A4F654-4162-4600-8EB3-88D1E42F368D
 
@@ -125,7 +127,7 @@ def get_api_pvs():
     # note the use of `pvs -a` which will return every physical volume including
     # ones that have not been initialized as "pv" by LVM
     stdout, stderr, returncode = process.call(
-        ['sudo', 'pvs', '-a', '--no-heading', '--separator=";"', '-o', fields]
+        ['pvs', '-a', '--no-heading', '--separator=";"', '-o', fields]
     )
 
     return _output_parser(stdout, fields)
@@ -137,6 +139,9 @@ def get_lv_from_argument(argument):
     in the form of `vg/lv`, but with some validation so that an argument that is a full
     path to a device can be ignored
     """
+    if argument.startswith('/'):
+        lv = get_lv(lv_path=argument)
+        return lv
     try:
         vg_name, lv_name = argument.split('/')
     except (ValueError, AttributeError):
@@ -181,7 +186,6 @@ def create_pv(device):
     to journals.
     """
     process.run([
-        'sudo',
         'pvcreate',
         '-v',  # verbose
         '-f',  # force it
@@ -190,39 +194,80 @@ def create_pv(device):
     ])
 
 
-def create_lv(name, group, size=None, **tags):
+def create_vg(name, *devices):
+    """
+    Create a Volume Group. Command looks like::
+
+        vgcreate --force --yes group_name device
+
+    Once created the volume group is returned as a ``VolumeGroup`` object
+    """
+    process.run([
+        'vgcreate',
+        '--force',
+        '--yes',
+        name] + list(devices)
+    )
+
+    vg = get_vg(vg_name=name)
+    return vg
+
+
+def remove_lv(path):
+    """
+    Removes a logical volume given it's absolute path.
+
+    Will return True if the lv is successfully removed or
+    raises a RuntimeError if the removal fails.
+    """
+    stdout, stderr, returncode = process.call(
+        [
+            'lvremove',
+            '-v',  # verbose
+            '-f',  # force it
+            path
+        ],
+        show_command=True,
+        terminal_verbose=True,
+    )
+    if returncode != 0:
+        raise RuntimeError("Unable to remove %s".format(path))
+    return True
+
+
+def create_lv(name, group, size=None, tags=None):
     """
     Create a Logical Volume in a Volume Group. Command looks like::
 
         lvcreate -L 50G -n gfslv vg0
 
-    ``name``, ``group``, and ``size`` are required. Tags are optional and are "translated" to include
-    the prefixes for the Ceph LVM tag API.
+    ``name``, ``group``, are required. If ``size`` is provided it must follow
+    lvm's size notation (like 1G, or 20M). Tags are an optional dictionary and is expected to
+    conform to the convention of prefixing them with "ceph." like::
 
+        {"ceph.block_device": "/dev/ceph/osd-1"}
     """
     # XXX add CEPH_VOLUME_LVM_DEBUG to enable -vvvv on lv operations
     type_path_tag = {
         'journal': 'ceph.journal_device',
         'data': 'ceph.data_device',
-        'block': 'ceph.block',
-        'wal': 'ceph.wal',
-        'db': 'ceph.db',
-        'lockbox': 'ceph.lockbox_device',
+        'block': 'ceph.block_device',
+        'wal': 'ceph.wal_device',
+        'db': 'ceph.db_device',
+        'lockbox': 'ceph.lockbox_device',  # XXX might not ever need this lockbox sorcery
     }
     if size:
         process.run([
-            'sudo',
             'lvcreate',
             '--yes',
             '-L',
-            '%sG' % size,
+            '%s' % size,
             '-n', name, group
         ])
     # create the lv with all the space available, this is needed because the
     # system call is different for LVM
     else:
         process.run([
-            'sudo',
             'lvcreate',
             '--yes',
             '-l',
@@ -231,17 +276,15 @@ def create_lv(name, group, size=None, **tags):
         ])
 
     lv = get_lv(lv_name=name, vg_name=group)
-    ceph_tags = {}
-    for k, v in tags.items():
-        ceph_tags['ceph.%s' % k] = v
-    lv.set_tags(ceph_tags)
+    lv.set_tags(tags)
 
     # when creating a distinct type, the caller doesn't know what the path will
     # be so this function will set it after creation using the mapping
-    path_tag = type_path_tag[tags['type']]
-    lv.set_tags(
-        {path_tag: lv.lv_path}
-    )
+    path_tag = type_path_tag.get(tags.get('ceph.type'))
+    if path_tag:
+        lv.set_tags(
+            {path_tag: lv.lv_path}
+        )
     return lv
 
 
@@ -606,6 +649,14 @@ class Volume(object):
         obj['path'] = self.lv_path
         return obj
 
+    def clear_tags(self):
+        """
+        Removes all tags from the Logical Volume.
+        """
+        for k, v in self.tags.items():
+            tag = "%s=%s" % (k, v)
+            process.run(['lvchange', '--deltag', tag, self.lv_path])
+
     def set_tags(self, tags):
         """
         :param tags: A dictionary of tag names and values, like::
@@ -635,11 +686,11 @@ class Volume(object):
         if self.tags.get(key):
             current_value = self.tags[key]
             tag = "%s=%s" % (key, current_value)
-            process.call(['sudo', 'lvchange', '--deltag', tag, self.lv_api['lv_path']])
+            process.call(['lvchange', '--deltag', tag, self.lv_api['lv_path']])
 
         process.call(
             [
-                'sudo', 'lvchange',
+                'lvchange',
                 '--addtag', '%s=%s' % (key, value), self.lv_path
             ]
         )
@@ -698,11 +749,11 @@ class PVolume(object):
         if self.tags.get(key):
             current_value = self.tags[key]
             tag = "%s=%s" % (key, current_value)
-            process.call(['sudo', 'pvchange', '--deltag', tag, self.pv_name])
+            process.call(['pvchange', '--deltag', tag, self.pv_name])
 
         process.call(
             [
-                'sudo', 'pvchange',
+                'pvchange',
                 '--addtag', '%s=%s' % (key, value), self.pv_name
             ]
         )
